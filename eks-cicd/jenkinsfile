@@ -1,0 +1,23 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Clone Repo') {
+            steps {
+                git 'https://github.com/yakiradela/eks-ci-cd.git'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo 'Building the project...'
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                echo 'Deploying to EKS...'
+            }
+        }
+    }
+}
