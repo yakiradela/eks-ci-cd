@@ -1,17 +1,37 @@
+
 pipeline {
   agent any
 
   environment {
-    VAULT_ADDR = 'http://localhost:8200'
+    VAULT_ADDR = 'http://127.0.0.1:8200' // Vault רץ מקומית
+    TF_VAR_aws_region = 'us-east-1'      // לפי terraform.tfvars
   }
 
   stages {
+    stage('Start Vault (Local)') {
+      steps {
+        sh '''
+          nohup vault server -config=eks-cicd/vault/vault.hcl > vault.log 2>&1 &
+          sleep 5
+          export VAULT_ADDR=http://127.0.0.1:8200
+
+          # אתחול Vault (רק אם לא מאותחל)
+          if ! vault status | grep -q "Initialized.*true"; then
+            vault operator init -key-shares=1 -key-threshold=1 -format=json > init.json
+          fi
+
+          vault operator unseal $(jq -r .unseal_keys_b64[0] init.json)
+          vault login $(jq -r .root_token init.json)
+        '''
+      }
+    }
+
     stage('Fetch AWS Credentials from Vault') {
       steps {
         script {
           def creds = sh(script: "vault kv get -format=json aws/terraform-project", returnStdout: true)
           def parsed = readJSON text: creds
-          env.AWS_ACCESS_KEY_ID = parsed.data.data.aws_access_key_id
+          env.AWS_ACCESS_KEY_ID     = parsed.data.data.aws_access_key_id
           env.AWS_SECRET_ACCESS_KEY = parsed.data.data.aws_secret_access_key
         }
       }
@@ -19,20 +39,26 @@ pipeline {
 
     stage('Terraform Init') {
       steps {
-        sh 'terraform init'
+        dir('eks-cicd/infra') {
+          sh 'terraform init -reconfigure'
+        }
       }
     }
 
     stage('Terraform Plan') {
       steps {
-        sh 'terraform plan'
+        dir('eks-cicd/infra') {
+          sh 'terraform plan'
+        }
       }
     }
 
     stage('Terraform Apply') {
       steps {
         input "Apply infrastructure?"
-        sh 'terraform apply -auto-approve'
+        dir('eks-cicd/infra') {
+          sh 'terraform apply -auto-approve'
+        }
       }
     }
 
@@ -40,6 +66,13 @@ pipeline {
       steps {
         sh 'aws eks update-kubeconfig --region us-east-1 --name EKS-CLUSTER321'
       }
+    }
+  }
+
+  post {
+    always {
+      echo 'Cleaning up...'
+      sh 'pkill vault || true'
     }
   }
 }
