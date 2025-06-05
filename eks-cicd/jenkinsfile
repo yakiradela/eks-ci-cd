@@ -20,7 +20,7 @@ pipeline {
       agent {
         docker {
           image "${DOCKER_IMAGE}"
-          args '-u root:root'
+          args '-u root:root'  // מריץ כ-root בתוך הקונטיינר
         }
       }
 
@@ -30,14 +30,16 @@ pipeline {
       }
 
       stages {
-
         stage('Check Tools') {
           steps {
             sh '''
-              echo "--- Versions Check ---"
+              echo "--- Vault ---"
               vault --version || echo "Missing vault"
+              echo "--- Terraform ---"
               terraform --version || echo "Missing terraform"
+              echo "--- AWS CLI ---"
               aws --version || echo "Missing aws"
+              echo "--- jq ---"
               jq --version || echo "Missing jq"
             '''
           }
@@ -46,37 +48,36 @@ pipeline {
         stage('Start Vault') {
           steps {
             sh '''
-              set -e
-
               mkdir -p /vault/data
-
               echo ">>> Starting Vault server..."
               nohup vault server -config=eks-cicd/vault/vault.hcl > vault.log 2>&1 &
-
-              echo ">>> Waiting for Vault to be ready..."
-              for i in {1..10}; do
-                if curl -s http://127.0.0.1:8200/v1/sys/health | grep -q initialized; then
-                  echo "Vault is ready."
-                  break
-                fi
-                echo "Waiting..."
-                sleep 2
-              done
+              sleep 5
 
               export VAULT_ADDR=http://127.0.0.1:8200
 
               if ! vault status | grep -q "Initialized.*true"; then
-                echo ">>> Initializing Vault..."
                 vault operator init -key-shares=1 -key-threshold=1 -format=json > init.json
               fi
 
               vault operator unseal $(jq -r .unseal_keys_b64[0] init.json)
               vault login $(jq -r .root_token init.json)
 
-              echo ">>> Optional: Load test secret into Vault"
-              vault kv put aws/terraform-project \
-                aws_access_key_id=TESTKEY123 \
-                aws_secret_access_key=TESTSECRET123
+              # Enable KV secrets engine at path aws/ if not already enabled
+              vault secrets enable -path=aws kv-v2 || echo "kv engine aws already enabled"
+
+              # Create policy to allow full access to aws/*
+              cat <<EOF | vault policy write aws-policy -
+              path "aws/*" {
+                capabilities = ["create", "read", "update", "delete", "list"]
+              }
+              EOF
+
+              # Attach policy to the current token (root token should have all permissions anyway)
+              vault token lookup
+              # Note: root token has all permissions by default
+
+              # Put a test secret
+              vault kv put aws/terraform-project aws_access_key_id=TESTKEY123 aws_secret_access_key=TESTSECRET123
             '''
           }
         }
@@ -84,27 +85,10 @@ pipeline {
         stage('Fetch AWS Credentials from Vault') {
           steps {
             script {
-              try {
-                echo "🔐 Fetching AWS credentials from Vault..."
-                def creds = sh(
-                  script: '''
-                    set -ex
-                    vault kv get -format=json aws/terraform-project
-                  ''',
-                  returnStdout: true
-                ).trim()
-
-                echo "📦 Raw Vault output: ${creds.take(200)}..."
-
-                def parsed = readJSON text: creds
-                env.AWS_ACCESS_KEY_ID     = parsed.data.data.aws_access_key_id
-                env.AWS_SECRET_ACCESS_KEY = parsed.data.data.aws_secret_access_key
-
-                echo "✅ AWS credentials loaded successfully."
-              } catch (Exception e) {
-                echo "❌ Failed to fetch AWS credentials: ${e.message}"
-                error("Vault fetch failed. Please check Vault status or secret path.")
-              }
+              def creds = sh(script: "vault kv get -format=json aws/terraform-project", returnStdout: true).trim()
+              def parsed = readJSON text: creds
+              env.AWS_ACCESS_KEY_ID     = parsed.data.data.aws_access_key_id
+              env.AWS_SECRET_ACCESS_KEY = parsed.data.data.aws_secret_access_key
             }
           }
         }
@@ -153,10 +137,11 @@ pipeline {
 
       post {
         always {
-          echo '🧹 Cleaning up Vault process...'
+          echo 'Cleaning up Vault process...'
           sh 'pkill vault || true'
         }
       }
     }
   }
 }
+
