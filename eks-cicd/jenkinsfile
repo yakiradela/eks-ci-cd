@@ -1,78 +1,117 @@
-
 pipeline {
   agent any
 
   environment {
-    VAULT_ADDR = 'http://127.0.0.1:8200' // Vault רץ מקומית
-    TF_VAR_aws_region = 'us-east-1'      // לפי terraform.tfvars
+    VAULT_ADDR = 'http://127.0.0.1:8200'
+    TF_VAR_aws_region = 'us-east-1'
+    DOCKER_IMAGE = 'jenkins-tools:latest'
   }
 
   stages {
-    stage('Start Vault (Local)') {
+    stage('Build Docker Image') {
       steps {
-        sh '''
-          nohup vault server -config=eks-cicd/vault/vault.hcl > vault.log 2>&1 &
-          sleep 5
-          export VAULT_ADDR=http://127.0.0.1:8200
-
-          # אתחול Vault (רק אם לא מאותחל)
-          if ! vault status | grep -q "Initialized.*true"; then
-            vault operator init -key-shares=1 -key-threshold=1 -format=json > init.json
-          fi
-
-          vault operator unseal $(jq -r .unseal_keys_b64[0] init.json)
-          vault login $(jq -r .root_token init.json)
-        '''
-      }
-    }
-
-    stage('Fetch AWS Credentials from Vault') {
-      steps {
-        script {
-          def creds = sh(script: "vault kv get -format=json aws/terraform-project", returnStdout: true)
-          def parsed = readJSON text: creds
-          env.AWS_ACCESS_KEY_ID     = parsed.data.data.aws_access_key_id
-          env.AWS_SECRET_ACCESS_KEY = parsed.data.data.aws_secret_access_key
+        dir('eks-cicd') {
+          sh 'docker build -t $DOCKER_IMAGE -f Dockerfile .'
         }
       }
     }
 
-    stage('Terraform Init') {
-      steps {
-        dir('eks-cicd/infra') {
-          sh 'terraform init -reconfigure'
+    stage('Run CI in Docker') {
+      agent {
+        docker {
+          image "${DOCKER_IMAGE}"
+          args '-u root:root'  // מריץ כ-root בתוך הקונטיינר
         }
       }
-    }
 
-    stage('Terraform Plan') {
-      steps {
-        dir('eks-cicd/infra') {
-          sh 'terraform plan'
+      environment {
+        VAULT_ADDR = 'http://127.0.0.1:8200'
+        TF_VAR_aws_region = 'us-east-1'
+      }
+
+      stages {
+        stage('Check Tools') {
+          steps {
+            sh '''
+              echo "--- Vault ---"
+              vault --version || echo "Missing vault"
+              echo "--- Terraform ---"
+              terraform --version || echo "Missing terraform"
+              echo "--- AWS CLI ---"
+              aws --version || echo "Missing aws"
+              echo "--- jq ---"
+              jq --version || echo "Missing jq"
+            '''
+          }
+        }
+
+        stage('Start Vault') {
+          steps {
+            sh '''
+              nohup vault server -config=eks-cicd/vault/vault.hcl > vault.log 2>&1 &
+              sleep 5
+
+              export VAULT_ADDR=http://127.0.0.1:8200
+
+              if ! vault status | grep -q "Initialized.*true"; then
+                vault operator init -key-shares=1 -key-threshold=1 -format=json > init.json
+              fi
+
+              vault operator unseal $(jq -r .unseal_keys_b64[0] init.json)
+              vault login $(jq -r .root_token init.json)
+            '''
+          }
+        }
+
+        stage('Fetch AWS Credentials from Vault') {
+          steps {
+            script {
+              def creds = sh(script: "vault kv get -format=json aws/terraform-project", returnStdout: true)
+              def parsed = readJSON text: creds
+              env.AWS_ACCESS_KEY_ID     = parsed.data.data.aws_access_key_id
+              env.AWS_SECRET_ACCESS_KEY = parsed.data.data.aws_secret_access_key
+            }
+          }
+        }
+
+        stage('Terraform Init') {
+          steps {
+            dir('eks-cicd/infra') {
+              sh 'terraform init -reconfigure'
+            }
+          }
+        }
+
+        stage('Terraform Plan') {
+          steps {
+            dir('eks-cicd/infra') {
+              sh 'terraform plan'
+            }
+          }
+        }
+
+        stage('Terraform Apply') {
+          steps {
+            input "Apply infrastructure?"
+            dir('eks-cicd/infra') {
+              sh 'terraform apply -auto-approve'
+            }
+          }
+        }
+
+        stage('Update Kubeconfig') {
+          steps {
+            sh 'aws eks update-kubeconfig --region us-east-1 --name EKS-CLUSTER321'
+          }
         }
       }
-    }
 
-    stage('Terraform Apply') {
-      steps {
-        input "Apply infrastructure?"
-        dir('eks-cicd/infra') {
-          sh 'terraform apply -auto-approve'
+      post {
+        always {
+          echo 'Cleaning up...'
+          sh 'pkill vault || true'
         }
       }
-    }
-
-    stage('Update Kubeconfig') {
-      steps {
-        sh 'aws eks update-kubeconfig --region us-east-1 --name EKS-CLUSTER321'
-      }
-    }
-  }
-
-  post {
-    always {
-      echo 'Cleaning up...'
-      sh 'pkill vault || true'
     }
   }
 }
